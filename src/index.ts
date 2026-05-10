@@ -169,7 +169,7 @@ class TwitterAPIMCPServer {
           } as Tool,
           {
             name: 'search_tweets',
-            description: 'Search for tweets using keywords',
+            description: 'Search for tweets using keywords via advanced_search. Results are filtered internally: only tweets from authors who are Blue Verified AND have DMs enabled are returned. Authors not meeting these criteria or the minimum follower threshold are silently filtered out with a summary message.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -187,6 +187,16 @@ class TwitterAPIMCPServer {
                   type: 'string',
                   description: 'Type of search results',
                   enum: ['recent', 'popular', 'mixed'],
+                },
+                min_followers: {
+                  type: 'number',
+                  description: 'Minimum number of followers an author must have for their tweet to be included (default: 0)',
+                  minimum: 0,
+                },
+                max_followers: {
+                  type: 'number',
+                  description: 'Maximum number of followers an author must have for their tweet to be included (default: unlimited)',
+                  minimum: 0,
                 },
               },
               required: ['query'],
@@ -352,7 +362,9 @@ class TwitterAPIMCPServer {
             return await this.searchTweets(
               args.query as string,
               args.count as number,
-              args.result_type as string
+              args.result_type as string,
+              args.min_followers as number,
+              args.max_followers as number | undefined
             );
 
           case 'get_tweet_by_id':
@@ -497,11 +509,79 @@ class TwitterAPIMCPServer {
       userName: username,
       count: Math.min(count, 100),
     });
+
+    // Extract tweets array from response
+    const rawData = data as Record<string, unknown>;
+    const innerData = rawData?.data as Record<string, unknown> | undefined;
+    const tweets: unknown[] = Array.isArray(data)
+      ? data
+      : innerData
+        ? (innerData?.tweets as unknown[] ?? [])
+        : (rawData?.tweets as unknown[] ?? []);
+
+    // Activity filter: check if the most recent tweet is older than 60 days
+    if (tweets.length > 0) {
+      const firstTweet = tweets[0] as Record<string, unknown>;
+      const createdAt = firstTweet?.createdAt as string | undefined;
+      if (createdAt) {
+        const tweetDate = new Date(createdAt);
+        const now = new Date();
+        const diffDays = (now.getTime() - tweetDate.getTime()) / (1000 * 60 * 60 * 24);
+        if (diffDays > 60) {
+          const daysAgo = Math.floor(diffDays);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `[MCP internal filter] This blogger does not qualify: their last post was ${daysAgo} days ago (more than 60 days). Low activity account.`,
+              },
+            ],
+          };
+        }
+      }
+    }
+
+    // Build compact response: blogger info + posts not older than 60 days as numbered list
+    const now = new Date();
+    const cutoff = 60 * 24 * 60 * 60 * 1000; // 60 days in ms
+
+    // Extract author info from first tweet
+    let bloggerName = '';
+    let bloggerBio = '';
+    if (tweets.length > 0) {
+      const author = (tweets[0] as Record<string, unknown>)?.author as Record<string, unknown> | undefined;
+      bloggerName = (author?.name as string) ?? (author?.userName as string) ?? '';
+      const profileBio = author?.profile_bio as Record<string, unknown> | undefined;
+      bloggerBio = (profileBio?.description as string) ?? (author?.description as string) ?? '';
+    }
+
+    // Filter posts not older than 60 days and collect their texts
+    const recentTexts: string[] = [];
+    for (const tweet of tweets) {
+      const t = tweet as Record<string, unknown>;
+      const createdAt = t?.createdAt as string | undefined;
+      if (createdAt) {
+        const tweetDate = new Date(createdAt);
+        if (now.getTime() - tweetDate.getTime() <= cutoff) {
+          const text = t?.text as string | undefined;
+          if (text) recentTexts.push(text);
+        }
+      }
+    }
+
+    const postsString = recentTexts.map((text, i) => `${i + 1}. ${text}`).join('\n');
+
+    const output = [
+      `Blogger: ${bloggerName}`,
+      `Bio: ${bloggerBio}`,
+      `Posts (last 60 days):\n${postsString || '(none)'}`,
+    ].join('\n\n');
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(data, null, 2),
+          text: output,
         },
       ],
     };
@@ -510,18 +590,61 @@ class TwitterAPIMCPServer {
   private async searchTweets(
     query: string,
     count: number = 10,
-    resultType: string = 'recent'
+    resultType: string = 'recent',
+    minFollowers: number = 0,
+    maxFollowers?: number
   ): Promise<CallToolResult> {
     const data = await this.makeRequest(`/tweet/advanced_search`, {
       query,
       count: Math.min(count, 100),
       result_type: resultType,
     });
+
+    // Extract tweets array from response
+    const tweets: any[] = Array.isArray(data) ? data : (data?.tweets || data?.data || []);
+    const totalFetched = tweets.length;
+
+    // Filter by isBlueVerified === true, canDm === true, min/max followers
+    const filtered = tweets.filter((tweet: any) => {
+      const author = tweet?.author ?? tweet;
+      const isBlueVerified = author?.isBlueVerified === true;
+      const canDm = author?.canDm === true;
+      const followers = typeof author?.followers === 'number' ? author.followers : 0;
+      const meetsMin = followers >= minFollowers;
+      const meetsMax = maxFollowers === undefined || followers <= maxFollowers;
+      return isBlueVerified && canDm && meetsMin && meetsMax;
+    });
+
+    const removedCount = totalFetched - filtered.length;
+
+    // Map to compact format: only fields needed for blogger analysis
+    const compact = filtered.map((tweet: any) => {
+      const author = tweet?.author ?? tweet;
+      const profileBio = author?.profile_bio as Record<string, unknown> | undefined;
+      const bio = (profileBio?.description as string) ?? (author?.description as string) ?? '';
+      return {
+        userName: author?.userName ?? '',
+        followers: author?.followers ?? 0,
+        description: bio,
+        location: author?.location ?? '',
+        text: tweet?.text ?? '',
+        createdAt: tweet?.createdAt ?? '',
+      };
+    });
+
+    const followersCriteria = maxFollowers !== undefined
+      ? `followers >= ${minFollowers} and <= ${maxFollowers}`
+      : `followers >= ${minFollowers}`;
+    const filterSummary =
+      removedCount > 0
+        ? `[MCP internal filter] ${removedCount} out of ${totalFetched} tweet(s) were removed because their authors did not meet the criteria: isBlueVerified=true, canDm=true, ${followersCriteria}.`
+        : `[MCP internal filter] All ${totalFetched} tweet(s) passed the filter (isBlueVerified=true, canDm=true, ${followersCriteria}).`;
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(data, null, 2),
+          text: filterSummary + '\n\n' + JSON.stringify(compact, null, 2),
         },
       ],
     };
